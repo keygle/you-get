@@ -4,21 +4,19 @@ import getopt
 import json
 import locale
 import os
+import platform
 import re
 import sys
 from urllib import request, parse
-import platform
-import threading
 
 from .version import __version__
-from .util import log, sogou_proxy_server, get_filename, unescape_html
+from .util import log
+from .util.strings import get_filename, unescape_html
 
 dry_run = False
 force = False
 player = None
 extractor_proxy = None
-sogou_proxy = None
-sogou_env = None
 cookies_txt = None
 
 fake_headers = {
@@ -35,10 +33,9 @@ else:
     default_encoding = locale.getpreferredencoding().lower()
 
 def tr(s):
-    try:
-        s.encode(default_encoding)
+    if default_encoding == 'utf-8':
         return s
-    except:
+    else:
         return str(s.encode('utf-8'))[2:-1]
 
 # DEPRECATED in favor of match1()
@@ -112,38 +109,6 @@ def escape_file_path(path):
     path = path.replace('*', '-')
     path = path.replace('?', '-')
     return path
-
-# DEPRECATED in favor of util.legitimize()
-def filenameable(text):
-    """Converts a string to a legal filename through various OSes.
-    """
-    # All POSIX systems
-    text = text.translate({
-        0: None,
-        ord('/'): '-',
-    })
-    if platform.system() == 'Windows': # For Windows
-        text = text.translate({
-            ord(':'): '-',
-            ord('*'): '-',
-            ord('?'): '-',
-            ord('\\'): '-',
-            ord('\"'): '\'',
-            ord('<'): '-',
-            ord('>'): '-',
-            ord('|'): '-',
-            ord('+'): '-',
-            ord('['): '(',
-            ord(']'): ')',
-        })
-    else:
-        if text.startswith("."):
-            text = text[1:]
-        if platform.system() == 'Darwin': # For Mac OS
-            text = text.translate({
-                ord(':'): '-',
-            })
-    return text
 
 def ungzip(data):
     """Decompresses data for Content-Encoding: gzip.
@@ -234,8 +199,8 @@ def url_size(url, faker = False):
     else:
         response = request.urlopen(url)
 
-    size = int(response.headers['content-length'])
-    return size
+    size = response.headers['content-length']
+    return int(size) if size!=None else float('inf')
 
 # TO BE DEPRECATED
 # urls_size() does not have a faker
@@ -261,6 +226,7 @@ def url_info(url, faker = False):
         'video/webm': 'webm',
         'video/x-flv': 'flv',
         'video/x-ms-asf': 'asf',
+        'audio/mp4': 'mp4',
         'audio/mpeg': 'mp3'
     }
     if type in mapping:
@@ -280,7 +246,7 @@ def url_info(url, faker = False):
             ext = None
 
     if headers['transfer-encoding'] != 'chunked':
-        size = int(headers['content-length'])
+        size = headers['content-length'] and int(headers['content-length'])
     else:
         size = None
 
@@ -318,7 +284,7 @@ def url_save(url, filepath, bar, refer = None, is_part = False, faker = False):
     elif not os.path.exists(os.path.dirname(filepath)):
         os.mkdir(os.path.dirname(filepath))
 
-    temp_filepath = filepath + '.download'
+    temp_filepath = filepath + '.download' if file_size!=float('inf') else filepath
     received = 0
     if not force:
         open_mode = 'ab'
@@ -346,7 +312,8 @@ def url_save(url, filepath, bar, refer = None, is_part = False, faker = False):
             end_length = end = int(response.headers['content-range'][6:].split('/')[1])
             range_length = end_length - range_start
         except:
-            range_length = int(response.headers['content-length'])
+            content_length = response.headers['content-length']
+            range_length = int(content_length) if content_length!=None else float('inf')
 
         if file_size != received + range_length:
             received = 0
@@ -526,13 +493,13 @@ def download_urls(urls, title, ext, total_size, output_dir='.', refer=None, merg
             traceback.print_exc(file = sys.stdout)
             pass
 
-    title = get_filename(title)
+    title = tr(get_filename(title))
 
     filename = '%s.%s' % (title, ext)
     filepath = os.path.join(output_dir, filename)
     if total_size:
         if not force and os.path.exists(filepath) and os.path.getsize(filepath) >= total_size * 0.9:
-            print('Skipping %s: file already exists' % tr(filepath))
+            print('Skipping %s: file already exists' % filepath)
             print()
             return
         bar = SimpleProgressBar(total_size, len(urls))
@@ -559,7 +526,7 @@ def download_urls(urls, title, ext, total_size, output_dir='.', refer=None, merg
         if not merge:
             print()
             return
-        if ext == 'flv':
+        if ext in ['flv', 'f4v']:
             try:
                 from .processor.ffmpeg import has_ffmpeg_installed
                 if has_ffmpeg_installed():
@@ -606,13 +573,13 @@ def download_urls_chunked(urls, title, ext, total_size, output_dir='.', refer=No
 
     assert ext in ('ts')
 
-    title = get_filename(title)
+    title = tr(get_filename(title))
 
     filename = '%s.%s' % (title, 'ts')
     filepath = os.path.join(output_dir, filename)
     if total_size:
         if not force and os.path.exists(filepath[:-3] + '.mkv'):
-            print('Skipping %s: file already exists' % tr(filepath[:-3] + '.mkv'))
+            print('Skipping %s: file already exists' % filepath[:-3] + '.mkv')
             print()
             return
         bar = SimpleProgressBar(total_size, len(urls))
@@ -675,21 +642,22 @@ def download_urls_chunked(urls, title, ext, total_size, output_dir='.', refer=No
 
     print()
 
-def download_rtmp_url(url, playpath, title, ext, total_size=0, output_dir='.', refer=None, merge=True, faker=False):
+def download_rtmp_url(url,title, ext,params={}, total_size=0, output_dir='.', refer=None, merge=True, faker=False):
     assert url
     if dry_run:
         print('Real URL:\n%s\n' % [url])
-        print('Real Playpath:\n%s\n' % [playpath])
+        if params.get("-y",False): #None or unset ->False
+            print('Real Playpath:\n%s\n' % [params.get("-y")])
         return
 
     if player:
         from .processor.rtmpdump import play_rtmpdump_stream
-        play_rtmpdump_stream(player, url, playpath)
+        play_rtmpdump_stream(player, url, params)
         return
 
     from .processor.rtmpdump import has_rtmpdump_installed, download_rtmpdump_stream
     assert has_rtmpdump_installed(), "RTMPDump not installed."
-    download_rtmpdump_stream(url, playpath, title, ext, output_dir)
+    download_rtmpdump_stream(url,  title, ext,params, output_dir)
 
 def playlist_not_supported(name):
     def f(*args, **kwargs):
@@ -740,6 +708,8 @@ def print_info(site_info, title, type, size):
         type_info = "Advanced Systems Format (%s)" % type
     #elif type in ['video/mpeg']:
     #    type_info = "MPEG video (%s)" % type
+    elif type in ['audio/mp4']:
+        type_info = "MPEG-4 audio (%s)" % type
     elif type in ['audio/mpeg']:
         type_info = "MP3 (%s)" % type
     else:
@@ -750,6 +720,18 @@ def print_info(site_info, title, type, size):
     print("Type:      ", type_info)
     print("Size:      ", round(size / 1048576, 2), "MiB (" + str(size) + " Bytes)")
     print()
+
+def mime_to_container(mime):
+    mapping = {
+        'video/3gpp': '3gp',
+        'video/mp4': 'mp4',
+        'video/webm': 'webm',
+        'video/x-flv': 'flv',
+    }
+    if mime in mapping:
+        return mapping[mime]
+    else:
+        return mime.split('/')[1]
 
 def parse_host(host):
     """Parses host name and port number from a string.
@@ -762,9 +744,6 @@ def parse_host(host):
     hostname = o.hostname or "0.0.0.0"
     port = o.port or 0
     return (hostname, port)
-
-def get_sogou_proxy():
-    return sogou_proxy
 
 def set_proxy(proxy):
     proxy_handler = request.ProxyHandler({
@@ -790,6 +769,8 @@ def set_http_proxy(proxy):
     opener = request.build_opener(proxy_support)
     request.install_opener(opener)
 
+
+
 def download_main(download, download_playlist, urls, playlist, **kwargs):
     for url in urls:
         if url.startswith('https://'):
@@ -802,18 +783,8 @@ def download_main(download, download_playlist, urls, playlist, **kwargs):
         else:
             download(url, **kwargs)
 
-def get_version():
-    try:
-        import subprocess
-        real_dir = os.path.dirname(os.path.realpath(__file__))
-        git_hash = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], cwd=real_dir, stderr=subprocess.DEVNULL).decode('utf-8').strip()
-        assert git_hash
-        return '%s-%s' % (__version__, git_hash)
-    except:
-        return __version__
-
 def script_main(script_name, download, download_playlist = None):
-    version = 'You-Get %s, a video downloader.' % get_version()
+    version = 'You-Get %s, a video downloader.' % __version__
     help = 'Usage: %s [OPTION]... [URL]...\n' % script_name
     help += '''\nStartup options:
     -V | --version                           Display the version and exit.
@@ -831,13 +802,11 @@ def script_main(script_name, download, download_playlist = None):
     -x | --http-proxy <HOST:PORT>            Use specific HTTP proxy for downloading.
     -y | --extractor-proxy <HOST:PORT>       Use specific HTTP proxy for extracting stream data.
          --no-proxy                          Don't use any proxy. (ignore $http_proxy)
-    -S | --sogou                             Use a Sogou proxy server for downloading.
-         --sogou-proxy <HOST:PORT>           Run a standalone Sogou proxy server.
          --debug                             Show traceback on KeyboardInterrupt.
     '''
 
-    short_opts = 'Vhfiuc:nSF:o:p:x:y:'
-    opts = ['version', 'help', 'force', 'info', 'url', 'cookies', 'no-merge', 'no-proxy', 'debug', 'sogou', 'format=', 'stream=', 'output-dir=', 'player=', 'http-proxy=', 'extractor-proxy=', 'sogou-proxy=', 'sogou-env=']
+    short_opts = 'Vhfiuc:nF:o:p:x:y:'
+    opts = ['version', 'help', 'force', 'info', 'url', 'cookies', 'no-merge', 'no-proxy', 'debug', 'format=', 'stream=', 'itag=', 'output-dir=', 'player=', 'http-proxy=', 'extractor-proxy=', 'lang=']
     if download_playlist:
         short_opts = 'l' + short_opts
         opts = ['playlist'] + opts
@@ -853,8 +822,6 @@ def script_main(script_name, download, download_playlist = None):
     global dry_run
     global player
     global extractor_proxy
-    global sogou_proxy
-    global sogou_env
     global cookies_txt
     cookies_txt = None
 
@@ -862,6 +829,7 @@ def script_main(script_name, download, download_playlist = None):
     playlist = False
     merge = True
     stream_id = None
+    lang = None
     output_dir = '.'
     proxy = None
     extractor_proxy = None
@@ -892,7 +860,7 @@ def script_main(script_name, download, download_playlist = None):
             proxy = ''
         elif o in ('--debug',):
             traceback = True
-        elif o in ('-F', '--format', '--stream'):
+        elif o in ('-F', '--format', '--stream', '--itag'):
             stream_id = a
         elif o in ('-o', '--output-dir'):
             output_dir = a
@@ -902,152 +870,129 @@ def script_main(script_name, download, download_playlist = None):
             proxy = a
         elif o in ('-y', '--extractor-proxy'):
             extractor_proxy = a
-        elif o in ('-S', '--sogou'):
-            sogou_proxy = ("0.0.0.0", 0)
-        elif o in ('--sogou-proxy',):
-            sogou_proxy = parse_host(a)
-        elif o in ('--sogou-env',):
-            sogou_env = a
+        elif o in ('--lang',):
+            lang = a
         else:
             log.e("try 'you-get --help' for more options")
             sys.exit(2)
     if not args:
-        if sogou_proxy is not None:
-            try:
-                if sogou_env is not None:
-                    server = sogou_proxy_server(sogou_proxy, network_env=sogou_env)
-                else:
-                    server = sogou_proxy_server(sogou_proxy)
-                server.serve_forever()
-            except KeyboardInterrupt:
-                if traceback:
-                    raise
-                else:
-                    sys.exit()
-        else:
-            print(help)
-            sys.exit()
+        print(help)
+        sys.exit()
 
     set_http_proxy(proxy)
 
     try:
         if stream_id:
-            download_main(download, download_playlist, args, playlist, stream_id=stream_id, output_dir=output_dir, merge=merge, info_only=info_only)
+            if not extractor_proxy:
+                download_main(download, download_playlist, args, playlist, stream_id=stream_id, output_dir=output_dir, merge=merge, info_only=info_only)
+            else:
+                download_main(download, download_playlist, args, playlist, stream_id=stream_id, extractor_proxy=extractor_proxy, output_dir=output_dir, merge=merge, info_only=info_only)
         else:
-            download_main(download, download_playlist, args, playlist, output_dir=output_dir, merge=merge, info_only=info_only)
+            if not extractor_proxy:
+                download_main(download, download_playlist, args, playlist, output_dir=output_dir, merge=merge, info_only=info_only)
+            else:
+                download_main(download, download_playlist, args, playlist, extractor_proxy=extractor_proxy, output_dir=output_dir, merge=merge, info_only=info_only)
     except KeyboardInterrupt:
         if traceback:
             raise
         else:
             sys.exit(1)
 
+def url_to_module(url):
+    from .extractors import netease, w56, acfun, baidu, baomihua, bilibili, blip, catfun, cntv, cbs, coursera, dailymotion, dongting, douban, douyutv, ehow, facebook, freesound, google, sina, ifeng, alive, instagram, iqiyi, joy, jpopsuki, khan, ku6, kugou, kuwo, letv, magisto, miomio, mixcloud, mtv81, nicovideo, pptv, qq, sohu, songtaste, soundcloud, ted, theplatform, tudou, tucao, tumblr, vid48, videobam, vimeo, vine, vk, xiami, yinyuetai, youku, youtube, zhanqi
 
+    video_host = r1(r'https?://([^/]+)/', url)
+    video_url = r1(r'https?://[^/]+(.*)', url)
+    assert video_host and video_url, 'invalid url: ' + url
 
-class VideoExtractor():
-    def __init__(self, *args):
-        self.url = None
-        self.title = None
-        self.vid = None
-        self.streams = {}
-        self.streams_sorted = []
+    if video_host.endswith('.com.cn'):
+        video_host = video_host[:-3]
+    domain = r1(r'(\.[^.]+\.[^.]+)$', video_host) or video_host
+    assert domain, 'unsupported url: ' + url
 
-        if args:
-            self.url = args[0]
-
-    def download_by_url(self, url, **kwargs):
-        self.url = url
-
-        global extractor_proxy
-        if extractor_proxy:
-            set_proxy(parse_host(extractor_proxy))
-        self.prepare(**kwargs)
-        self.streams_sorted = [dict([('id', stream_type['id'])] + list(self.streams[stream_type['id']].items())) for stream_type in self.__class__.stream_types if stream_type['id'] in self.streams]
-        self.extract(**kwargs)
-        if extractor_proxy:
-            unset_proxy()
-
-        self.download(**kwargs)
-
-    def download_by_vid(self, vid, **kwargs):
-        self.vid = vid
-
-        global extractor_proxy
-        if extractor_proxy:
-            set_proxy(parse_host(extractor_proxy))
-        self.prepare(**kwargs)
-        self.streams_sorted = [dict([('id', stream_type['id'])] + list(self.streams[stream_type['id']].items())) for stream_type in self.__class__.stream_types if stream_type['id'] in self.streams]
-        self.extract(**kwargs)
-        if extractor_proxy:
-            unset_proxy()
-
-        self.download(**kwargs)
-
-    def prepare(self, **kwargs):
-        pass
-        #raise NotImplementedError()
-
-    def extract(self, **kwargs):
-        pass
-        #raise NotImplementedError()
-
-    def p_stream(self, stream_id):
-        stream = self.streams[stream_id]
-        print("    - id:            \033[7m%s\033[0m" % stream_id)
-        print("      container:     %s" % stream['container'])
-        print("      video-profile: %s" % stream['video_profile'])
-        if 'size' in stream:
-            print("      size:          %s MiB (%s bytes)" % (round(stream['size'] / 1048576, 1), stream['size']))
+    k = r1(r'([^.]+)', domain)
+    downloads = {
+        '163': netease,
+        '56': w56,
+        'acfun': acfun,
+        'baidu': baidu,
+        'baomihua': baomihua,
+        'bilibili': bilibili,
+        'blip': blip,
+        'catfun': catfun,
+        'cntv': cntv,
+        'cbs': cbs,
+        'coursera': coursera,
+        'dailymotion': dailymotion,
+        'dongting': dongting,
+        'douban': douban,
+        'douyutv': douyutv,
+        'ehow': ehow,
+        'facebook': facebook,
+        'freesound': freesound,
+        'google': google,
+        'iask': sina,
+        'ifeng': ifeng,
+        'in': alive,
+        'instagram': instagram,
+        'iqiyi': iqiyi,
+        'joy': joy,
+        'jpopsuki': jpopsuki,
+        'kankanews': bilibili,
+        'khanacademy': khan,
+        'ku6': ku6,
+        'kugou': kugou,
+        'kuwo': kuwo,
+        'letv': letv,
+        'magisto': magisto,
+        'miomio': miomio,
+        'mixcloud': mixcloud,
+        'mtv81': mtv81,
+        'nicovideo': nicovideo,
+        'pptv': pptv,
+        'qq': qq,
+        'sina': sina,
+        'smgbb': bilibili,
+        'sohu': sohu,
+        'songtaste': songtaste,
+        'soundcloud': soundcloud,
+        'ted': ted,
+        'theplatform': theplatform,
+        "tucao":tucao,
+        'tudou': tudou,
+        'tumblr': tumblr,
+        'vid48': vid48,
+        'videobam': videobam,
+        'vimeo': vimeo,
+        'vine': vine,
+        'vk': vk,
+        'xiami': xiami,
+        'yinyuetai': yinyuetai,
+        'youku': youku,
+        'youtu': youtube,
+        'youtube': youtube,
+        'zhanqi': zhanqi,
+    }
+    if k in downloads:
+        return downloads[k], url
+    else:
+        import http.client
+        conn = http.client.HTTPConnection(video_host)
+        conn.request("HEAD", video_url)
+        res = conn.getresponse()
+        location = res.getheader('location')
+        if location is None:
+            raise NotImplementedError(url)
         else:
-            print("      size:          Unknown")
-        print("    # download-with: \033[4myou-get --format=%s [URL]\033[0m" % stream_id)
-        print()
+            return url_to_module(location)
 
-    def p(self, stream_id=None):
-        print("site:                %s" % self.__class__.name)
-        print("title:               %s" % self.title)
-        if stream_id:
-            # Print the stream
-            print("stream:")
-            self.p_stream(stream_id)
+def any_download(url, **kwargs):
+    m, url = url_to_module(url)
+    m.download(url, **kwargs)
 
-        elif stream_id is None:
-            # Print stream with best quality
-            print("stream:              # Best quality")
-            stream_id = self.streams_sorted[0]['id']
-            self.p_stream(stream_id)
+def any_download_playlist(url, **kwargs):
+    m, url = url_to_module(url)
+    m.download_playlist(url, **kwargs)
 
-        elif stream_id == []:
-            # Print all available streams
-            print("streams:             # Available quality and codecs")
-            for stream in self.streams_sorted:
-                self.p_stream(stream['id'])
-
-    def download(self, **kwargs):
-        if 'info_only' in kwargs and kwargs['info_only']:
-            if 'stream_id' in kwargs and kwargs['stream_id']:
-                # Display the stream
-                stream_id = kwargs['stream_id']
-                self.p(stream_id)
-            else:
-                # Display all available streams
-                self.p([])
-
-        else:
-            if 'stream_id' in kwargs and kwargs['stream_id']:
-                # Download the stream
-                stream_id = kwargs['stream_id']
-            else:
-                # Download stream with the best quality
-                stream_id = self.streams_sorted[0]['id']
-
-            self.p(None)
-
-            urls = self.streams[stream_id]['src']
-            if not urls:
-                log.e('[Failed] Cannot extract video source.')
-                log.e('This is most likely because the video has not been made available in your country.')
-                log.e('You may try to use a proxy via \'-y\' for extracting stream data.')
-                exit(1)
-            download_urls(urls, self.title, self.streams[stream_id]['container'], self.streams[stream_id]['size'], output_dir=kwargs['output_dir'], merge=kwargs['merge'])
-
-        self.__init__()
+def main():
+    script_main('you-get', any_download, any_download_playlist)
